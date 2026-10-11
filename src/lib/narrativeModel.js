@@ -170,38 +170,29 @@ export const DEFAULT_VISUAL_PRESETS = [
   },
 ];
 
-// Supported voices via Gemini 3.8 TTS & CodeCraft OpenAI-Compatible TTS
+// Supported voices via Gemini 3.8 TTS
 export const SUPPORTED_VOICES = [
   { id: "Kore", label: "Kore (Warm & Clear — Gemini TTS)", gender: "Female", provider: "gemini" },
   { id: "Charon", label: "Charon (Deep & Authoritative — Gemini TTS)", gender: "Male", provider: "gemini" },
   { id: "Puck", label: "Puck (Energetic & Engaging — Gemini TTS)", gender: "Male", provider: "gemini" },
   { id: "Fenrir", label: "Fenrir (Resonant & Suspenseful — Gemini TTS)", gender: "Male", provider: "gemini" },
   { id: "Zephyr", label: "Zephyr (Calm & Conversational — Gemini TTS)", gender: "Female", provider: "gemini" },
-  { id: "alloy", label: "Alloy (Balanced & Versatile — CodeCraft TTS)", gender: "Neutral", provider: "codecraft" },
-  { id: "onyx", label: "Onyx (Deep & Cinematic — CodeCraft TTS)", gender: "Male", provider: "codecraft" },
-  { id: "nova", label: "Nova (Bright & Engaging — CodeCraft TTS)", gender: "Female", provider: "codecraft" },
-  { id: "echo", label: "Echo (Warm & Clear — CodeCraft TTS)", gender: "Male", provider: "codecraft" },
-  { id: "fable", label: "Fable (Expressive Storyteller — CodeCraft TTS)", gender: "Neutral", provider: "codecraft" },
-  { id: "shimmer", label: "Shimmer (Crisp & Articulate — CodeCraft TTS)", gender: "Female", provider: "codecraft" },
 ];
 
-export const CODECRAFT_TEXT_MODELS = [
-  { id: "gpt-4o", label: "GPT-4o (Multimodal & Vision)" },
-  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol (CodeCraft Flagship)" },
-  { id: "claude-sonnet-5", label: "Claude Sonnet 5 (Creative Scriptwriting)" },
-  { id: "claude-opus-5.5", label: "Claude Opus 5.5 (Deep Analysis)" },
-  { id: "deepseek-v4-pro-max", label: "DeepSeek V4 Pro Max" },
+export const GEMINI_TEXT_MODELS = [
+  { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash (Ultra-Fast Generation — Recommended)" },
+  { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite (Maximum Speed)" },
+  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (Deep Analysis)" },
 ];
 
-export const CODECRAFT_IMAGE_MODELS = [
-  { id: "dall-e-3", label: "DALL·E 3 (CodeCraft Image Generation)" },
-  { id: "flux-1.1-pro", label: "Flux 1.1 Pro (Cinematic Visuals)" },
-  { id: "sdxl-lightning", label: "SDXL Lightning (Fast Storyboard)" },
+export const GEMINI_IMAGE_MODELS = [
+  { id: "gemini-3.1-flash-lite-image", label: "Gemini 3.1 Flash Lite Image (Fast Scene Generation)" },
+  { id: "gemini-nano-banana-2.1", label: "Gemini Nano Banana 2.1 (High Detail)" },
 ];
 
-export const CODECRAFT_TTS_MODELS = [
-  { id: "tts-1", label: "TTS-1 (Standard Low-Latency Audio)" },
-  { id: "tts-1-hd", label: "TTS-1-HD (High-Definition Narration)" },
+export const GEMINI_TTS_MODELS = [
+  { id: "gemini-3.8-flash-lite-tts", label: "Gemini 3.8 Flash Lite TTS (Ultra-Fast Voiceover)" },
+  { id: "gemini-3.8-flash-tts", label: "Gemini 3.8 Flash TTS (Expressive Narration)" },
 ];
 
 export const DEFAULT_CHANNELS = [
@@ -210,7 +201,7 @@ export const DEFAULT_CHANNELS = [
     name: "Main Documentary Channel",
     niche: "History, Science & Deep Mysteries",
     aspectRatio: "16:9",
-    voiceId: "onyx",
+    voiceId: "Charon",
     promptRules:
       "SCRIPT RULES: Open with a paradoxical curiosity hook in the first 15 seconds, structured into 4 clear narrative chapters, conversational yet deeply researched with natural pauses.\nSCENE & IMAGE RULES: Cinematic realistic illustration, deep oceanic blues and warm amber rim lighting, consistent character proportions, 35mm widescreen depth of field, no text inside scene frames.\nTHUMBNAIL RULES: High-contrast focal subject on the right, dramatic rim lighting, curiosity-gap visual metaphor, bold 3-word overlay text space on the left.",
     additionalScriptRules:
@@ -261,7 +252,7 @@ export function createDefaultGlobalSettings() {
     defaultScriptPresetId: "documentary",
     defaultVisualPresetId: "cinematic_realistic",
     imageSettings: {
-      provider: "codecraft", // "codecraft" | "gemini"
+      provider: "gemini",
       aspectRatio: "16:9",
       quality: "High (1080p / 4K Prompt Spec)",
       defaultFraming: "medium shot",
@@ -269,26 +260,21 @@ export function createDefaultGlobalSettings() {
       negativePrompt: "no text in this frame, no watermarks, no logos, no deformed anatomy",
     },
     voiceSettings: {
-      provider: "gemini", // "gemini" | "codecraft"
+      provider: "gemini",
       voiceId: "Charon",
       language: "English (US)",
       speed: 1.0,
       format: "WAV / MP3",
     },
     aiSettings: {
-      textProvider: "gemini", // "gemini" | "codecraft"
-      imageProvider: "codecraft", // "codecraft" | "gemini"
-      audioProvider: "gemini", // "gemini" | "codecraft"
+      textProvider: "gemini",
+      imageProvider: "gemini",
+      audioProvider: "gemini",
       textModel: "gemini-3.8-flash",
+      imageModel: "gemini-3.1-flash-lite-image",
       ttsModel: "gemini-3.8-flash-lite-tts",
-      codecraft: {
-        apiKey: "",
-        baseUrl: "https://codecraftapi.com/v1",
-        textModel: "gpt-4o",
-        imageModel: "dall-e-3",
-        ttsModel: "tts-1",
-        ttsVoice: "onyx",
-      },
+      ttsVoice: "Charon",
+      geminiApiKeys: [],
     },
   };
 }

@@ -7,38 +7,93 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "35mb" }));
 
-// Server-side in-memory runtime store for CodeCraft API configuration
-let runtimeCodeCraftConfig = {
-  apiKey: process.env.CODECRAFT_API_KEY || "",
-  baseUrl: (process.env.CODECRAFT_BASE_URL || "https://codecraftapi.com/v1").replace(/\/+$/, ""),
-  textModel: process.env.CODECRAFT_TEXT_MODEL || "gpt-4o",
-  imageModel: process.env.CODECRAFT_IMAGE_MODEL || "dall-e-3",
-  ttsModel: process.env.CODECRAFT_TTS_MODEL || "tts-1",
-  ttsVoice: process.env.CODECRAFT_TTS_VOICE || "alloy",
+// Server-side in-memory runtime store for Gemini API keys & models
+let runtimeGeminiConfig = {
+  apiKeys: [] as string[],
+  textModel: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
+  imageModel: process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image-preview",
+  ttsModel: process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview",
+  ttsVoice: process.env.GEMINI_TTS_VOICE || "Charon",
 };
 
-function resolveGeminiEnvKey(): string {
-  const raw =
-    process.env.GEMINI_API_KEY ||
-    process.env.GOOGLE_API_KEY ||
-    process.env.GOOGLE_GENAI_API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-    "";
-  const trimmed = String(raw).trim();
-  if (!trimmed || trimmed === "MY_GEMINI_API_KEY" || trimmed === "YOUR_GEMINI_API_KEY") {
-    return "";
+// Multi-key round-robin cursor and temporary cooldown tracker for failed/rate-limited keys
+let geminiKeyCursor = 0;
+const failedKeyCooldownUntil = new Map<string, number>();
+
+function parseKeysString(val: unknown): string[] {
+  if (!val) return [];
+  if (Array.isArray(val)) {
+    return val.flatMap((v) => parseKeysString(v));
   }
-  return trimmed;
+  const str = String(val).trim();
+  if (!str) return [];
+  if (str.startsWith("[") && str.endsWith("]")) {
+    try {
+      const arr = JSON.parse(str);
+      if (Array.isArray(arr)) return arr.flatMap((v) => parseKeysString(v));
+    } catch {}
+  }
+  return str
+    .split(/[\n\r,;|\s]+/)
+    .map((k) => k.trim().replace(/^["']+|["']+$/g, ""))
+    .filter(
+      (k) =>
+        k.length >= 15 &&
+        k !== "MY_GEMINI_API_KEY" &&
+        k !== "YOUR_GEMINI_API_KEY" &&
+        !k.includes("••")
+    );
 }
 
-function getAI() {
-  const apiKey = resolveGeminiEnvKey();
-  if (!apiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is not configured in server environment. In Vercel Dashboard -> Project Settings -> Environment Variables, add GEMINI_API_KEY (for Production, Preview & Development) and Redeploy, or configure CodeCraft API in Settings."
-    );
+export function resolveGeminiApiKeys(reqBody?: any): string[] {
+  const seen = new Set<string>();
+  const addAll = (items: string[]) => {
+    for (const k of items) {
+      if (k && !seen.has(k)) seen.add(k);
+    }
+  };
+
+  // 0. Request-supplied Gemini keys (from user Settings multi-key manager)
+  if (reqBody) {
+    addAll(parseKeysString(reqBody.geminiApiKeys));
+    addAll(parseKeysString(reqBody.geminiKeys));
+    addAll(parseKeysString(reqBody?.geminiConfig?.apiKeys));
+    addAll(parseKeysString(reqBody?.geminiConfig?.apiKey));
+    addAll(parseKeysString(reqBody?.codecraftConfig?.apiKeys));
+    addAll(parseKeysString(reqBody?.codecraftConfig?.apiKey));
   }
+
+  // 1. Server runtime-configured Gemini keys
+  addAll(runtimeGeminiConfig.apiKeys);
+
+  // 2. Primary multi-key or single-key env vars
+  addAll(parseKeysString(process.env.GEMINI_API_KEYS));
+  addAll(parseKeysString(process.env.GEMINI_API_KEY));
+  addAll(parseKeysString(process.env.GOOGLE_API_KEYS));
+  addAll(parseKeysString(process.env.GOOGLE_API_KEY));
+  addAll(parseKeysString(process.env.GOOGLE_GENAI_API_KEY));
+  addAll(parseKeysString(process.env.VITE_GEMINI_API_KEYS));
+  addAll(parseKeysString(process.env.VITE_GEMINI_API_KEY));
+  addAll(parseKeysString(process.env.NEXT_PUBLIC_GEMINI_API_KEY));
+
+  // 3. Numbered env vars: GEMINI_API_KEY_1..50, GOOGLE_API_KEY_1..50, GEMINI_KEY_1..50
+  for (let i = 1; i <= 50; i++) {
+    addAll(parseKeysString(process.env[`GEMINI_API_KEY_${i}`]));
+    addAll(parseKeysString(process.env[`GOOGLE_API_KEY_${i}`]));
+    addAll(parseKeysString(process.env[`GEMINI_KEY_${i}`]));
+  }
+
+  // 4. Any other environment variable matching /^(GEMINI|GOOGLE)_.*API_KEY/i
+  for (const [envName, envVal] of Object.entries(process.env)) {
+    if (/^(?:VITE_|NEXT_PUBLIC_)?(?:GEMINI|GOOGLE)_.*API_KEY/i.test(envName)) {
+      addAll(parseKeysString(envVal));
+    }
+  }
+
+  return Array.from(seen);
+}
+
+function createGeminiClient(apiKey: string) {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -49,41 +104,78 @@ function getAI() {
   });
 }
 
-function getCodeCraftCreds(reqBody: any) {
-  const cc = reqBody?.codecraftConfig || {};
-  const rawKey =
-    cc.apiKey ||
-    runtimeCodeCraftConfig.apiKey ||
-    process.env.CODECRAFT_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    process.env.VITE_CODECRAFT_API_KEY ||
-    "";
-  const apiKey = String(rawKey).trim();
-  const baseUrl = (
-    cc.baseUrl ||
-    runtimeCodeCraftConfig.baseUrl ||
-    process.env.CODECRAFT_BASE_URL ||
-    "https://codecraftapi.com/v1"
-  ).replace(/\/+$/, "");
-  const textModel = cc.textModel || runtimeCodeCraftConfig.textModel || process.env.CODECRAFT_TEXT_MODEL || "gpt-4o";
-  const imageModel = cc.imageModel || runtimeCodeCraftConfig.imageModel || process.env.CODECRAFT_IMAGE_MODEL || "dall-e-3";
-  const ttsModel = cc.ttsModel || runtimeCodeCraftConfig.ttsModel || process.env.CODECRAFT_TTS_MODEL || "tts-1";
-  const ttsVoice = cc.ttsVoice || runtimeCodeCraftConfig.ttsVoice || process.env.CODECRAFT_TTS_VOICE || "alloy";
-  return { apiKey, baseUrl, textModel, imageModel, ttsVoice, ttsModel };
+// Execute a Gemini SDK operation across all configured Gemini API keys.
+// - By default (useRoundRobin = false), starts with Key #1, and if it fails or hits quota, immediately switches to Key #2, Key #3, etc.
+// - When parallel chunks are running (parallelWorkerIdx provided), distributes workers across healthy keys so multiple chunks generate simultaneously at maximum speed, while still failing over to the next key if any key fails!
+async function executeGeminiWithFailover<T>(
+  operation: (ai: GoogleGenAI, keyIndex: number, totalKeys: number) => Promise<T>,
+  reqBody?: any,
+  parallelWorkerIdx?: number
+): Promise<T> {
+  const allKeys = resolveGeminiApiKeys(reqBody);
+  if (allKeys.length === 0) {
+    throw new Error(
+      "لم يتم إدخال أي مفتاح Gemini API. يرجى فتح الإعدادات (Settings) وإضافة مفتاح Gemini API واحد أو أكثر."
+    );
+  }
+
+  const now = Date.now();
+  // Prefer healthy keys that are not currently in cooldown; if all are in cooldown, try all keys in order
+  const healthyKeys = allKeys.filter((k) => (failedKeyCooldownUntil.get(k) || 0) <= now);
+  const cooldownKeys = allKeys.filter((k) => (failedKeyCooldownUntil.get(k) || 0) > now);
+  const orderedPool = [...healthyKeys, ...cooldownKeys];
+
+  const startOffset =
+    typeof parallelWorkerIdx === "number" && orderedPool.length > 1
+      ? parallelWorkerIdx % orderedPool.length
+      : 0;
+
+  let lastError: any = null;
+  for (let attempt = 0; attempt < orderedPool.length; attempt++) {
+    const idx = (startOffset + attempt) % orderedPool.length;
+    const key = orderedPool[idx];
+    const originalKeyNumber = allKeys.indexOf(key) + 1;
+    const ai = createGeminiClient(key);
+    try {
+      const result = await operation(ai, originalKeyNumber - 1, allKeys.length);
+      failedKeyCooldownUntil.delete(key);
+      return result;
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err || "");
+      // Put failed / quota-exceeded key on a 45-second cooldown so subsequent requests immediately skip to the working key
+      failedKeyCooldownUntil.set(key, Date.now() + 45_000);
+      if (attempt < orderedPool.length - 1) {
+        console.warn(
+          `[Gemini Multi-Key Failover] Key #${originalKeyNumber}/${allKeys.length} failed (${msg.slice(
+            0,
+            100
+          )}), switching immediately to next key...`
+        );
+        continue;
+      }
+    }
+  }
+  throw lastError;
 }
 
-function resolveEffectiveProvider(requestedProvider: string | undefined, reqBody: any): "gemini" | "codecraft" {
-  const cc = getCodeCraftCreds(reqBody);
-  const hasGemini = !!resolveGeminiEnvKey();
-  const hasCodeCraft = !!cc.apiKey;
-  if (requestedProvider === "codecraft") {
-    if (hasCodeCraft) return "codecraft";
-    if (hasGemini) return "gemini";
-    return "codecraft";
-  }
-  if (hasGemini) return "gemini";
-  if (hasCodeCraft) return "codecraft";
+function resolveEffectiveProvider(_requestedProvider: string | undefined, _reqBody: any): string {
   return "gemini";
+}
+
+function getCodeCraftCreds(_reqBody: any) {
+  return {
+    apiKey: "",
+    baseUrl: "",
+    textModel: runtimeGeminiConfig.textModel,
+    imageModel: runtimeGeminiConfig.imageModel,
+    ttsModel: runtimeGeminiConfig.ttsModel,
+    ttsVoice: runtimeGeminiConfig.ttsVoice,
+  };
+}
+
+async function callCodeCraftChat(_opts: any): Promise<string> {
+  return "";
 }
 
 function parseJsonClean(rawText: string) {
@@ -118,190 +210,124 @@ function parseJsonClean(rawText: string) {
   }
 }
 
-async function callCodeCraftChat({
-  apiKey,
-  baseUrl,
-  model,
-  prompt,
-  systemInstruction,
-  imageBase64,
-  imageMime,
-  jsonMode = false,
-}: {
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-  prompt: string;
-  systemInstruction?: string;
-  imageBase64?: string | null;
-  imageMime?: string;
-  jsonMode?: boolean;
-}) {
-  if (!apiKey) {
-    throw new Error(
-      "CodeCraft API key is not configured. Add CODECRAFT_API_KEY in Vercel Environment Variables or configure it in Settings > CodeCraft API."
-    );
-  }
-  const messages: any[] = [];
-  if (systemInstruction) {
-    messages.push({ role: "system", content: systemInstruction });
-  }
-  if (imageBase64) {
-    const cleanB64 = imageBase64.replace(/^data:[^;]+;base64,/, "");
-    messages.push({
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        {
-          type: "image_url",
-          image_url: { url: `data:${imageMime || "image/jpeg"};base64,${cleanB64}` },
-        },
-      ],
-    });
-  } else {
-    messages.push({ role: "user", content: prompt });
-  }
-
-  const doRequest = async (useJsonFormat: boolean) => {
-    const body: any = {
-      model,
-      messages,
-      temperature: 0.7,
-    };
-    if (useJsonFormat) {
-      body.response_format = { type: "json_object" };
-    }
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    return { res, data };
-  };
-
-  let { res, data } = await doRequest(jsonMode);
-  if (!res.ok && jsonMode) {
-    const retry = await doRequest(false);
-    res = retry.res;
-    data = retry.data;
-  }
-
-  if (!res.ok) {
-    throw new Error(
-      data?.error?.message || data?.error || `CodeCraft Chat API failed (${res.status})`
-    );
-  }
-  return data?.choices?.[0]?.message?.content || "";
-}
-
-// Health & Provider Status Route
+// Health & Gemini Multi-Key Pool Status Route
 app.get("/api/health", (_req, res) => {
+  const geminiKeys = resolveGeminiApiKeys();
   res.json({
     ok: true,
     runtime: process.env.VERCEL ? "vercel-serverless" : "node-express",
-    geminiConfigured: !!resolveGeminiEnvKey(),
-    codecraftConfigured: !!(
-      runtimeCodeCraftConfig.apiKey ||
-      process.env.CODECRAFT_API_KEY ||
-      process.env.OPENAI_API_KEY ||
-      process.env.VITE_CODECRAFT_API_KEY
-    ),
+    geminiConfigured: geminiKeys.length > 0,
+    geminiKeyCount: geminiKeys.length,
     youtubeApiConfigured: !!process.env.YOUTUBE_API_KEY,
   });
 });
 
 app.get("/api/providers/status", (_req, res) => {
+  const geminiKeys = resolveGeminiApiKeys();
   res.json({
-    geminiConfigured: !!resolveGeminiEnvKey(),
-    codecraftConfigured: !!(
-      runtimeCodeCraftConfig.apiKey ||
-      process.env.CODECRAFT_API_KEY ||
-      process.env.OPENAI_API_KEY ||
-      process.env.VITE_CODECRAFT_API_KEY
-    ),
+    geminiConfigured: geminiKeys.length > 0,
+    geminiKeyCount: geminiKeys.length,
     youtubeApiConfigured: !!process.env.YOUTUBE_API_KEY,
-    codecraftConfig: {
-      hasKey: !!(
-        runtimeCodeCraftConfig.apiKey ||
-        process.env.CODECRAFT_API_KEY ||
-        process.env.OPENAI_API_KEY ||
-        process.env.VITE_CODECRAFT_API_KEY
-      ),
-      baseUrl: runtimeCodeCraftConfig.baseUrl,
-      textModel: runtimeCodeCraftConfig.textModel,
-      imageModel: runtimeCodeCraftConfig.imageModel,
-      ttsModel: runtimeCodeCraftConfig.ttsModel,
-      ttsVoice: runtimeCodeCraftConfig.ttsVoice,
+    geminiConfig: {
+      hasKey: geminiKeys.length > 0,
+      keyCount: geminiKeys.length,
+      textModel: runtimeGeminiConfig.textModel,
+      imageModel: runtimeGeminiConfig.imageModel,
+      ttsModel: runtimeGeminiConfig.ttsModel,
+      ttsVoice: runtimeGeminiConfig.ttsVoice,
     },
   });
 });
 
-app.post("/api/providers/codecraft-config", async (req, res) => {
+// Save & Test Multiple Gemini API Keys
+const handleUpdateGeminiConfig = async (req: express.Request, res: express.Response) => {
   try {
-    const { apiKey, baseUrl, textModel, imageModel, ttsModel, ttsVoice, testConnection } =
-      req.body || {};
-    if (typeof apiKey === "string" && apiKey.trim() && !apiKey.includes("••")) {
-      runtimeCodeCraftConfig.apiKey = apiKey.trim();
+    const {
+      apiKeys,
+      apiKey,
+      textModel,
+      imageModel,
+      ttsModel,
+      ttsVoice,
+      testConnection,
+    } = req.body || {};
+
+    const parsedIncoming = [
+      ...parseKeysString(apiKeys),
+      ...parseKeysString(apiKey),
+    ];
+    if (parsedIncoming.length > 0 || Array.isArray(apiKeys) || typeof apiKey === "string") {
+      runtimeGeminiConfig.apiKeys = Array.from(new Set(parsedIncoming));
+      failedKeyCooldownUntil.clear();
     }
-    if (baseUrl) runtimeCodeCraftConfig.baseUrl = String(baseUrl).replace(/\/+$/, "");
-    if (textModel) runtimeCodeCraftConfig.textModel = String(textModel).trim();
-    if (imageModel) runtimeCodeCraftConfig.imageModel = String(imageModel).trim();
-    if (ttsModel) runtimeCodeCraftConfig.ttsModel = String(ttsModel).trim();
-    if (ttsVoice) runtimeCodeCraftConfig.ttsVoice = String(ttsVoice).trim();
+    if (textModel) runtimeGeminiConfig.textModel = String(textModel).trim();
+    if (imageModel) runtimeGeminiConfig.imageModel = String(imageModel).trim();
+    if (ttsModel) runtimeGeminiConfig.ttsModel = String(ttsModel).trim();
+    if (ttsVoice) runtimeGeminiConfig.ttsVoice = String(ttsVoice).trim();
 
-    const effectiveKey =
-      (typeof apiKey === "string" && apiKey.trim() && !apiKey.includes("••")
-        ? apiKey.trim()
-        : "") ||
-      runtimeCodeCraftConfig.apiKey ||
-      process.env.CODECRAFT_API_KEY ||
-      process.env.OPENAI_API_KEY ||
-      "";
+    const activePool = resolveGeminiApiKeys(req.body);
+    const keyStatuses: Array<{ index: number; masked: string; ok: boolean; error?: string }> = [];
 
-    let modelsList: string[] = [];
     if (testConnection) {
-      if (!effectiveKey) {
+      if (activePool.length === 0) {
         return res.status(400).json({
           error:
-            "No CodeCraft API key provided. Enter your API key or set CODECRAFT_API_KEY in Vercel Environment Variables.",
+            "لم يتم إدخال أي مفتاح Gemini API. أضف مفتاحاً واحداً أو أكثر ثم اضغط فحص المفاتيح.",
         });
       }
-      const mRes = await fetch(`${runtimeCodeCraftConfig.baseUrl}/models`, {
-        headers: { Authorization: `Bearer ${effectiveKey}` },
-      });
-      if (mRes.ok) {
-        const mData = await mRes.json().catch(() => ({}));
-        if (Array.isArray(mData?.data)) {
-          modelsList = mData.data.map((m: any) => m.id).filter(Boolean);
-        }
-      } else {
-        await callCodeCraftChat({
-          apiKey: effectiveKey,
-          baseUrl: runtimeCodeCraftConfig.baseUrl,
-          model: runtimeCodeCraftConfig.textModel,
-          prompt: "Reply with OK",
+      // Test all keys in parallel for fast verification
+      const checks = await Promise.all(
+        activePool.map(async (k, idx) => {
+          const masked = `${k.slice(0, 6)}...${k.slice(-4)}`;
+          try {
+            const ai = createGeminiClient(k);
+            await ai.models.generateContent({
+              model: "gemini-3.8-flash",
+              contents: "OK",
+              config: {
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
+            failedKeyCooldownUntil.delete(k);
+            return { index: idx + 1, masked, ok: true };
+          } catch (err: any) {
+            return {
+              index: idx + 1,
+              masked,
+              ok: false,
+              error: String(err?.message || err || "Failed").slice(0, 120),
+            };
+          }
+        })
+      );
+      keyStatuses.push(...checks);
+      const workingCount = checks.filter((c) => c.ok).length;
+      if (workingCount === 0) {
+        return res.status(400).json({
+          error: `فشل الاتصال بجميع مفاتيح Gemini (${checks.length}).تأكد من صلاحية المفاتيح أو الحصة (Quota).`,
+          keyStatuses,
         });
       }
     }
 
     res.json({
       ok: true,
-      hasKey: !!effectiveKey,
-      baseUrl: runtimeCodeCraftConfig.baseUrl,
-      textModel: runtimeCodeCraftConfig.textModel,
-      imageModel: runtimeCodeCraftConfig.imageModel,
-      ttsModel: runtimeCodeCraftConfig.ttsModel,
-      ttsVoice: runtimeCodeCraftConfig.ttsVoice,
-      models: modelsList,
+      hasKey: activePool.length > 0,
+      keyCount: activePool.length,
+      workingCount: keyStatuses.length ? keyStatuses.filter((k) => k.ok).length : activePool.length,
+      keyStatuses,
+      textModel: runtimeGeminiConfig.textModel,
+      imageModel: runtimeGeminiConfig.imageModel,
+      ttsModel: runtimeGeminiConfig.ttsModel,
+      ttsVoice: runtimeGeminiConfig.ttsVoice,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to verify CodeCraft API connection." });
+    res.status(500).json({ error: err.message || "Failed to verify Gemini API keys." });
   }
-});
+};
+
+app.post("/api/providers/gemini-config", handleUpdateGeminiConfig);
+app.post("/api/providers/codecraft-config", handleUpdateGeminiConfig);
 
 // Robust YouTube URL & Video ID parser supporting watch, youtu.be, shorts, embed, live, mobile, and raw 11-char IDs
 export function extractVideoId(input: string): string | null {
@@ -591,7 +617,6 @@ IMPORTANT RULES:
       return res.json(parseJsonClean(rawJson));
     }
 
-    const ai = getAI();
     const parts: any[] = [];
     if (thumbnailBase64) {
       const cleanB64 = String(thumbnailBase64).replace(/^data:[^;]+;base64,/, "");
@@ -604,120 +629,123 @@ IMPORTANT RULES:
     }
     parts.push({ text: promptText });
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: { parts },
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            analysis: {
-              type: Type.OBJECT,
-              properties: {
-                mainTopic: { type: Type.STRING },
-                niche: { type: Type.STRING },
-                subNiche: { type: Type.STRING },
-                targetAudience: { type: Type.STRING },
-                curiosityGap: { type: Type.STRING },
-                openingHook: { type: Type.STRING },
-                storytellingStructure: { type: Type.STRING },
-                narrationTone: { type: Type.STRING },
-                visualStyle: { type: Type.STRING },
-                colorPalette: { type: Type.STRING },
-                characterDesign: { type: Type.STRING },
-                compositionLighting: { type: Type.STRING },
-                engagementFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                originalOpportunities: { type: Type.ARRAY, items: { type: Type.STRING } },
-                transcriptAnalyzed: { type: Type.BOOLEAN },
-              },
-              required: [
-                "mainTopic",
-                "niche",
-                "subNiche",
-                "targetAudience",
-                "curiosityGap",
-                "openingHook",
-                "storytellingStructure",
-                "narrationTone",
-                "visualStyle",
-                "colorPalette",
-                "characterDesign",
-                "compositionLighting",
-                "engagementFactors",
-                "originalOpportunities",
-                "transcriptAnalyzed",
-              ],
-            },
-            visualStyleLock: {
-              type: Type.OBJECT,
-              properties: {
-                artStyle: { type: Type.STRING },
-                characterRules: { type: Type.STRING },
-                facialVisibility: { type: Type.STRING },
-                clothingSilhouette: { type: Type.STRING },
-                colorPalette: { type: Type.STRING },
-                lighting: { type: Type.STRING },
-                backgroundTreatment: { type: Type.STRING },
-                composition: { type: Type.STRING },
-                lineworkShading: { type: Type.STRING },
-                aspectRatio: { type: Type.STRING },
-              },
-              required: [
-                "artStyle",
-                "characterRules",
-                "facialVisibility",
-                "clothingSilhouette",
-                "colorPalette",
-                "lighting",
-                "backgroundTreatment",
-                "composition",
-                "lineworkShading",
-                "aspectRatio",
-              ],
-            },
-            concepts: {
-              type: Type.ARRAY,
-              items: {
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: { parts },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              analysis: {
                 type: Type.OBJECT,
                 properties: {
-                  id: { type: Type.STRING },
-                  title: { type: Type.STRING },
-                  premise: { type: Type.STRING },
+                  mainTopic: { type: Type.STRING },
                   niche: { type: Type.STRING },
                   subNiche: { type: Type.STRING },
                   targetAudience: { type: Type.STRING },
-                  mainHook: { type: Type.STRING },
-                  storyStructure: { type: Type.STRING },
-                  narrationStyle: { type: Type.STRING },
-                  visualDirection: { type: Type.STRING },
-                  viewerAppeal: { type: Type.STRING },
-                  differentiation: { type: Type.STRING },
-                  payoff: { type: Type.STRING },
+                  curiosityGap: { type: Type.STRING },
+                  openingHook: { type: Type.STRING },
+                  storytellingStructure: { type: Type.STRING },
+                  narrationTone: { type: Type.STRING },
+                  visualStyle: { type: Type.STRING },
+                  colorPalette: { type: Type.STRING },
+                  characterDesign: { type: Type.STRING },
+                  compositionLighting: { type: Type.STRING },
+                  engagementFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  originalOpportunities: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  transcriptAnalyzed: { type: Type.BOOLEAN },
                 },
                 required: [
-                  "id",
-                  "title",
-                  "premise",
+                  "mainTopic",
                   "niche",
                   "subNiche",
                   "targetAudience",
-                  "mainHook",
-                  "storyStructure",
-                  "narrationStyle",
-                  "visualDirection",
-                  "viewerAppeal",
-                  "differentiation",
-                  "payoff",
+                  "curiosityGap",
+                  "openingHook",
+                  "storytellingStructure",
+                  "narrationTone",
+                  "visualStyle",
+                  "colorPalette",
+                  "characterDesign",
+                  "compositionLighting",
+                  "engagementFactors",
+                  "originalOpportunities",
+                  "transcriptAnalyzed",
                 ],
               },
+              visualStyleLock: {
+                type: Type.OBJECT,
+                properties: {
+                  artStyle: { type: Type.STRING },
+                  characterRules: { type: Type.STRING },
+                  facialVisibility: { type: Type.STRING },
+                  clothingSilhouette: { type: Type.STRING },
+                  colorPalette: { type: Type.STRING },
+                  lighting: { type: Type.STRING },
+                  backgroundTreatment: { type: Type.STRING },
+                  composition: { type: Type.STRING },
+                  lineworkShading: { type: Type.STRING },
+                  aspectRatio: { type: Type.STRING },
+                },
+                required: [
+                  "artStyle",
+                  "characterRules",
+                  "facialVisibility",
+                  "clothingSilhouette",
+                  "colorPalette",
+                  "lighting",
+                  "backgroundTreatment",
+                  "composition",
+                  "lineworkShading",
+                  "aspectRatio",
+                ],
+              },
+              concepts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    premise: { type: Type.STRING },
+                    niche: { type: Type.STRING },
+                    subNiche: { type: Type.STRING },
+                    targetAudience: { type: Type.STRING },
+                    mainHook: { type: Type.STRING },
+                    storyStructure: { type: Type.STRING },
+                    narrationStyle: { type: Type.STRING },
+                    visualDirection: { type: Type.STRING },
+                    viewerAppeal: { type: Type.STRING },
+                    differentiation: { type: Type.STRING },
+                    payoff: { type: Type.STRING },
+                  },
+                  required: [
+                    "id",
+                    "title",
+                    "premise",
+                    "niche",
+                    "subNiche",
+                    "targetAudience",
+                    "mainHook",
+                    "storyStructure",
+                    "narrationStyle",
+                    "visualDirection",
+                    "viewerAppeal",
+                    "differentiation",
+                    "payoff",
+                  ],
+                },
+              },
             },
+            required: ["analysis", "visualStyleLock", "concepts"],
           },
-          required: ["analysis", "visualStyleLock", "concepts"],
         },
-      },
-    });
+      }),
+      req.body
+    );
 
     const parsed = parseJsonClean(response.text || "{}");
     res.json(parsed);
@@ -748,57 +776,59 @@ Return strictly JSON with key "concepts" (array of 5 objects with id, title, pre
       return res.json(parseJsonClean(raw));
     }
 
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            concepts: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  title: { type: Type.STRING },
-                  premise: { type: Type.STRING },
-                  niche: { type: Type.STRING },
-                  subNiche: { type: Type.STRING },
-                  targetAudience: { type: Type.STRING },
-                  mainHook: { type: Type.STRING },
-                  storyStructure: { type: Type.STRING },
-                  narrationStyle: { type: Type.STRING },
-                  visualDirection: { type: Type.STRING },
-                  viewerAppeal: { type: Type.STRING },
-                  differentiation: { type: Type.STRING },
-                  payoff: { type: Type.STRING },
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              concepts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    premise: { type: Type.STRING },
+                    niche: { type: Type.STRING },
+                    subNiche: { type: Type.STRING },
+                    targetAudience: { type: Type.STRING },
+                    mainHook: { type: Type.STRING },
+                    storyStructure: { type: Type.STRING },
+                    narrationStyle: { type: Type.STRING },
+                    visualDirection: { type: Type.STRING },
+                    viewerAppeal: { type: Type.STRING },
+                    differentiation: { type: Type.STRING },
+                    payoff: { type: Type.STRING },
+                  },
+                  required: [
+                    "id",
+                    "title",
+                    "premise",
+                    "niche",
+                    "subNiche",
+                    "targetAudience",
+                    "mainHook",
+                    "storyStructure",
+                    "narrationStyle",
+                    "visualDirection",
+                    "viewerAppeal",
+                    "differentiation",
+                    "payoff",
+                  ],
                 },
-                required: [
-                  "id",
-                  "title",
-                  "premise",
-                  "niche",
-                  "subNiche",
-                  "targetAudience",
-                  "mainHook",
-                  "storyStructure",
-                  "narrationStyle",
-                  "visualDirection",
-                  "viewerAppeal",
-                  "differentiation",
-                  "payoff",
-                ],
               },
             },
+            required: ["concepts"],
           },
-          required: ["concepts"],
         },
-      },
-    });
+      }),
+      req.body
+    );
     res.json(parseJsonClean(response.text || "{}"));
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate concepts." });
@@ -882,14 +912,16 @@ Strict Requirements:
       return res.json({ script: (scriptText || "").trim() });
     }
 
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
-    });
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      }),
+      req.body
+    );
 
     res.json({ script: (response.text || "").trim() });
   } catch (err: any) {
@@ -958,27 +990,29 @@ app.post("/api/ai/generate-tts", async (req, res) => {
       });
     }
 
-    const ai = getAI();
     const validVoices = ["Puck", "Charon", "Kore", "Fenrir", "Zephyr"];
     const chosenVoice = validVoices.includes(voiceName) ? voiceName : "Kore";
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash-lite-tts",
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: excerpt }],
-        },
-      ],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: chosenVoice },
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.8-flash-lite-tts",
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: excerpt }],
+          },
+        ],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: chosenVoice },
+            },
           },
         },
-      },
-    });
+      }),
+      req.body
+    );
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) {
@@ -1067,16 +1101,18 @@ app.post("/api/ai/generate-scene-image", async (req, res) => {
       throw new Error("CodeCraft API did not return an image payload.");
     }
 
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite-image",
-      contents: { parts: [{ text: prompt }] },
-      config: {
-        imageConfig: {
-          aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9",
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.1-flash-lite-image",
+        contents: { parts: [{ text: prompt }] },
+        config: {
+          imageConfig: {
+            aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9",
+          },
         },
-      },
-    });
+      }),
+      req.body
+    );
     const parts = response.candidates?.[0]?.content?.parts || [];
     for (const part of parts) {
       if (part.inlineData?.data) {
@@ -1163,37 +1199,39 @@ CRITICAL DYNAMIC TIMING & CONTINUITY RULES:
         ? parsed.data
         : [];
     } else {
-      const ai = getAI();
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    scriptExcerpt: { type: Type.STRING },
-                    visualDescription: { type: Type.STRING },
-                    mainSubject: { type: Type.STRING },
-                    environment: { type: Type.STRING },
-                    emotionalTone: { type: Type.STRING },
-                    cameraFraming: { type: Type.STRING },
-                    transitionSuggestion: { type: Type.STRING },
+      const response = await executeGeminiWithFailover((ai) =>
+        ai.models.generateContent({
+          model: "gemini-3.8-flash",
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                scenes: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      scriptExcerpt: { type: Type.STRING },
+                      visualDescription: { type: Type.STRING },
+                      mainSubject: { type: Type.STRING },
+                      environment: { type: Type.STRING },
+                      emotionalTone: { type: Type.STRING },
+                      cameraFraming: { type: Type.STRING },
+                      transitionSuggestion: { type: Type.STRING },
+                    },
+                    required: ["scriptExcerpt", "visualDescription"],
                   },
-                  required: ["scriptExcerpt", "visualDescription"],
                 },
               },
+              required: ["scenes"],
             },
-            required: ["scenes"],
           },
-        },
-      });
+        }),
+        req.body
+      );
       const parsed = parseJsonClean(response.text || "{}");
       rawScenes = Array.isArray(parsed)
         ? parsed
@@ -1409,7 +1447,6 @@ CRITICAL STANDALONE RULE:
       );
       rawPrompts = chunkResults.flat();
     } else {
-      const ai = getAI();
       const imageParts: any[] = [];
       for (const img of (channelProfile?.styleReferenceImages || []).slice(0, 1)) {
         if (img?.dataUrl) {
@@ -1429,35 +1466,40 @@ CRITICAL STANDALONE RULE:
       }
 
       const chunkResults = await Promise.all(
-        chunks.map(async (chunk) => {
+        chunks.map(async (chunk, chunkIdx) => {
           const parts: any[] = [{ text: buildChunkPrompt(chunk) }, ...imageParts];
-          const response = await ai.models.generateContent({
-            model: "gemini-3.8-flash",
-            contents: [{ role: "user", parts }],
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  prompts: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        sceneId: { type: Type.STRING },
-                        sceneNumber: { type: Type.INTEGER },
-                        timestampTag: { type: Type.STRING },
-                        prompt: { type: Type.STRING },
+          const response = await executeGeminiWithFailover(
+            (ai) =>
+              ai.models.generateContent({
+                model: "gemini-3.8-flash",
+                contents: [{ role: "user", parts }],
+                config: {
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                  responseMimeType: "application/json",
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                      prompts: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            sceneId: { type: Type.STRING },
+                            sceneNumber: { type: Type.INTEGER },
+                            timestampTag: { type: Type.STRING },
+                            prompt: { type: Type.STRING },
+                          },
+                          required: ["sceneId", "sceneNumber", "timestampTag", "prompt"],
+                        },
                       },
-                      required: ["sceneId", "sceneNumber", "timestampTag", "prompt"],
                     },
+                    required: ["prompts"],
                   },
                 },
-                required: ["prompts"],
-              },
-            },
-          });
+              }),
+            req.body,
+            chunkIdx
+          );
           const parsed = parseJsonClean(response.text || "{}");
           return Array.isArray(parsed)
             ? parsed
@@ -1545,33 +1587,37 @@ Image Prompt: ${ip?.prompt || s.visualDescription}`;
         ? parsed.motionPrompts
         : [];
     } else {
-      const ai = getAI();
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              motionPrompts: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    sceneId: { type: Type.STRING },
-                    sceneNumber: { type: Type.INTEGER },
-                    prompt: { type: Type.STRING },
-                    editorMotion: { type: Type.STRING },
+      const response = await executeGeminiWithFailover(
+        (ai) =>
+          ai.models.generateContent({
+            model: "gemini-3.8-flash",
+            contents: prompt,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  motionPrompts: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        sceneId: { type: Type.STRING },
+                        sceneNumber: { type: Type.INTEGER },
+                        prompt: { type: Type.STRING },
+                        editorMotion: { type: Type.STRING },
+                      },
+                      required: ["sceneId", "sceneNumber", "prompt", "editorMotion"],
+                    },
                   },
-                  required: ["sceneId", "sceneNumber", "prompt", "editorMotion"],
                 },
+                required: ["motionPrompts"],
               },
             },
-            required: ["motionPrompts"],
-          },
-        },
-      });
+          }),
+        req.body
+      );
 
       const parsed = parseJsonClean(response.text || "{}");
       rawMotions = Array.isArray(parsed)
@@ -1692,7 +1738,6 @@ YOUTUBE SEO & POLICY REQUIREMENTS:
       return res.json(parseJsonClean(rawJson));
     }
 
-    const ai = getAI();
     const parts: any[] = [{ text: prompt }];
     for (const img of (channelProfile?.thumbnailReferenceImages || []).slice(0, 2)) {
       if (img?.dataUrl) {
@@ -1711,60 +1756,63 @@ YOUTUBE SEO & POLICY REQUIREMENTS:
       }
     }
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: [{ role: "user", parts }],
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            titles: { type: Type.ARRAY, items: { type: Type.STRING } },
-            description: { type: Type.STRING },
-            chapters: {
-              type: Type.ARRAY,
-              items: {
+    const response = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: [{ role: "user", parts }],
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              titles: { type: Type.ARRAY, items: { type: Type.STRING } },
+              description: { type: Type.STRING },
+              chapters: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    timestamp: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    isEstimate: { type: Type.BOOLEAN },
+                  },
+                  required: ["timestamp", "title", "isEstimate"],
+                },
+              },
+              tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+              hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+              thumbnails: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    conceptTitle: { type: Type.STRING },
+                    suggestedText: { type: Type.STRING },
+                    visualPrompt: { type: Type.STRING },
+                    compositionNotes: { type: Type.STRING },
+                  },
+                  required: ["id", "conceptTitle", "suggestedText", "visualPrompt", "compositionNotes"],
+                },
+              },
+              metadata: {
                 type: Type.OBJECT,
                 properties: {
-                  timestamp: { type: Type.STRING },
-                  title: { type: Type.STRING },
-                  isEstimate: { type: Type.BOOLEAN },
+                  category: { type: Type.STRING },
+                  language: { type: Type.STRING },
+                  madeForKids: { type: Type.BOOLEAN },
+                  license: { type: Type.STRING },
                 },
-                required: ["timestamp", "title", "isEstimate"],
+                required: ["category", "language", "madeForKids", "license"],
               },
             },
-            tags: { type: Type.ARRAY, items: { type: Type.STRING } },
-            hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
-            thumbnails: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  conceptTitle: { type: Type.STRING },
-                  suggestedText: { type: Type.STRING },
-                  visualPrompt: { type: Type.STRING },
-                  compositionNotes: { type: Type.STRING },
-                },
-                required: ["id", "conceptTitle", "suggestedText", "visualPrompt", "compositionNotes"],
-              },
-            },
-            metadata: {
-              type: Type.OBJECT,
-              properties: {
-                category: { type: Type.STRING },
-                language: { type: Type.STRING },
-                madeForKids: { type: Type.BOOLEAN },
-                license: { type: Type.STRING },
-              },
-              required: ["category", "language", "madeForKids", "license"],
-            },
+            required: ["titles", "description", "chapters", "tags", "hashtags", "thumbnails", "metadata"],
           },
-          required: ["titles", "description", "chapters", "tags", "hashtags", "thumbnails", "metadata"],
         },
-      },
-    });
+      }),
+      req.body
+    );
 
     res.json(parseJsonClean(response.text || "{}"));
   } catch (err: any) {

@@ -1,13 +1,45 @@
-// Clean Client Service Layer for AI & YouTube Pipeline APIs
-// Supports both Gemini and CodeCraft API (https://codecraftapi.com/v1) via server-side Express routes (/api/*).
+// Client Service Layer for AI & YouTube Pipeline APIs
+// Uses Google Gemini API with automatic Multi-Key Load Balancing, Parallel Execution & Instant Failover.
 
-async function postJson(endpoint, payload) {
+const GEMINI_KEYS_STORAGE_KEY = "uyns_gemini_api_keys_v1";
+
+export function getStoredGeminiKeys() {
+  try {
+    const raw = localStorage.getItem(GEMINI_KEYS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.map((k) => String(k || "").trim()).filter((k) => k.length >= 15);
+    }
+  } catch {}
+  return [];
+}
+
+export function setStoredGeminiKeys(keys) {
+  try {
+    const clean = (Array.isArray(keys) ? keys : [])
+      .map((k) => String(k || "").trim())
+      .filter((k) => k.length >= 15);
+    localStorage.setItem(GEMINI_KEYS_STORAGE_KEY, JSON.stringify(Array.from(new Set(clean))));
+  } catch {}
+}
+
+async function postJson(endpoint, payload = {}) {
+  const storedKeys = getStoredGeminiKeys();
+  const bodyPayload = {
+    ...payload,
+    geminiApiKeys:
+      Array.isArray(payload?.geminiApiKeys) && payload.geminiApiKeys.length > 0
+        ? payload.geminiApiKeys
+        : storedKeys,
+  };
+
   let res;
   try {
     res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(bodyPayload),
     });
   } catch (err) {
     throw new Error(`Network error reaching ${endpoint}: ${err.message || String(err)}`);
@@ -29,9 +61,18 @@ export async function fetchProviderStatus() {
   }
 }
 
-export async function updateServerCodeCraftConfig(configPayload) {
-  return postJson("/api/providers/codecraft-config", configPayload);
+export async function updateServerGeminiConfig(configPayload) {
+  if (Array.isArray(configPayload?.apiKeys)) {
+    setStoredGeminiKeys(configPayload.apiKeys);
+  }
+  return postJson("/api/providers/gemini-config", {
+    ...configPayload,
+    geminiApiKeys: configPayload?.apiKeys || getStoredGeminiKeys(),
+  });
 }
+
+// Backward-compatible alias
+export const updateServerCodeCraftConfig = updateServerGeminiConfig;
 
 export async function fetchYouTubeMetadata(url) {
   return postJson("/api/youtube/metadata", { url });
@@ -41,49 +82,61 @@ export async function analyzeReferenceAndConcepts(payload) {
   return postJson("/api/ai/analyze-reference", payload);
 }
 
-export async function regenerateConcepts(analysis, customDirection = "", provider = "gemini", codecraftConfig = null) {
-  return postJson("/api/ai/regenerate-concepts", { analysis, customDirection, provider, codecraftConfig });
+export async function regenerateConcepts(analysis, customDirection = "") {
+  return postJson("/api/ai/regenerate-concepts", { analysis, customDirection });
 }
 
 export async function generateOrEditScript(payload) {
   return postJson("/api/ai/generate-script", payload);
 }
 
-export async function generateVoiceoverTTS(text, voiceName = "Charon", provider = "gemini", codecraftConfig = null) {
-  return postJson("/api/ai/generate-tts", { text, voiceName, provider, codecraftConfig });
+export async function generateVoiceoverTTS(text, voiceName = "Charon") {
+  return postJson("/api/ai/generate-tts", { text, voiceName });
 }
 
-export async function generateSceneImage({ prompt, aspectRatio = "16:9", provider = "codecraft", codecraftConfig = null }) {
-  return postJson("/api/ai/generate-scene-image", { prompt, aspectRatio, provider, codecraftConfig });
+export async function generateSceneImage({ prompt, aspectRatio = "16:9" }) {
+  return postJson("/api/ai/generate-scene-image", { prompt, aspectRatio });
 }
 
 export async function generateSceneBreakdown(payload) {
   return postJson("/api/ai/scene-breakdown", payload);
 }
 
+// High-speed parallel batching across all active Gemini API keys
 export async function generateImagePromptsBatch(payload) {
-  const { scenes = [], batchSize = 20, ...rest } = payload;
-  const allPrompts = [];
-  for (let i = 0; i < scenes.length; i += batchSize) {
-    const chunk = scenes.slice(i, i + batchSize);
-    const res = await postJson("/api/ai/image-prompts", { scenes: chunk, ...rest });
-    if (Array.isArray(res.prompts)) {
-      allPrompts.push(...res.prompts);
-    }
+  const { scenes = [], batchSize = 15, ...rest } = payload;
+  if (scenes.length <= batchSize) {
+    const res = await postJson("/api/ai/image-prompts", { scenes, ...rest });
+    return { prompts: Array.isArray(res.prompts) ? res.prompts : [] };
   }
+  const chunks = [];
+  for (let i = 0; i < scenes.length; i += batchSize) {
+    chunks.push(scenes.slice(i, i + batchSize));
+  }
+  // Execute chunks in parallel across the Gemini key pool for maximum speed
+  const results = await Promise.all(
+    chunks.map((chunk) => postJson("/api/ai/image-prompts", { scenes: chunk, ...rest }))
+  );
+  const allPrompts = results.flatMap((r) => (Array.isArray(r.prompts) ? r.prompts : []));
   return { prompts: allPrompts };
 }
 
 export async function generateMotionPromptsBatch(payload) {
   const { scenes = [], imagePrompts = [], batchSize = 20, ...rest } = payload;
-  const allMotion = [];
-  for (let i = 0; i < scenes.length; i += batchSize) {
-    const chunk = scenes.slice(i, i + batchSize);
-    const res = await postJson("/api/ai/motion-prompts", { scenes: chunk, imagePrompts, ...rest });
-    if (Array.isArray(res.motionPrompts)) {
-      allMotion.push(...res.motionPrompts);
-    }
+  if (scenes.length <= batchSize) {
+    const res = await postJson("/api/ai/motion-prompts", { scenes, imagePrompts, ...rest });
+    return { motionPrompts: Array.isArray(res.motionPrompts) ? res.motionPrompts : [] };
   }
+  const chunks = [];
+  for (let i = 0; i < scenes.length; i += batchSize) {
+    chunks.push(scenes.slice(i, i + batchSize));
+  }
+  const results = await Promise.all(
+    chunks.map((chunk) =>
+      postJson("/api/ai/motion-prompts", { scenes: chunk, imagePrompts, ...rest })
+    )
+  );
+  const allMotion = results.flatMap((r) => (Array.isArray(r.motionPrompts) ? r.motionPrompts : []));
   return { motionPrompts: allMotion };
 }
 
